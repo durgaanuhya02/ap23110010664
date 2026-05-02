@@ -1,14 +1,11 @@
 # Campus Notifications Microservice — System Design
 
----
-
 # Stage 1
 
 ## Overview
 
 This document describes the REST API design and contract for a Campus Notification Platform where students receive real-time updates about Placements, Events, and Results.
 
----
 
 ## Core Actions the Notification Platform Should Support
 
@@ -20,14 +17,13 @@ This document describes the REST API design and contract for a Campus Notificati
 6. Send a notification (admin/HR action)
 7. Subscribe to real-time notifications (WebSocket)
 
----
 
 ## REST API Endpoints
 
 ### Base URL
-```
+
 /api/v1
-```
+
 
 ### Authentication
 All endpoints require a Bearer token in the Authorization header:
@@ -50,6 +46,7 @@ Authorization: Bearer <token>
 ```
 
 **Query Parameters:**
+
 | Parameter | Type    | Required | Description                              |
 |-----------|---------|----------|------------------------------------------|
 | page      | integer | No       | Page number for pagination (default: 1)  |
@@ -218,11 +215,11 @@ Authorization: Bearer <token>
 }
 ```
 
-| Field          | Type   | Required | Values                          |
-|----------------|--------|----------|---------------------------------|
-| type           | string | Yes      | "Placement", "Event", "Result"  |
-| message        | string | Yes      | Notification content            |
-| targetAudience | string | Yes      | "all" or specific student IDs   |
+| Field          | Type   | Required | Values                         |
+|----------------|--------|----------|--------------------------------|
+| type           | string | Yes      | "Placement", "Event", "Result" |
+| message        | string | Yes      | Notification content           |
+| targetAudience | string | Yes      | "all" or specific student IDs  |
 
 **Response (201 Created):**
 ```json
@@ -250,7 +247,6 @@ For real-time delivery, the platform uses **WebSockets** via the `ws` protocol.
 - Ideal for campus notifications where students are logged in on a dashboard
 
 ### WebSocket Endpoint
-
 ```
 ws://<host>/ws/notifications
 ```
@@ -265,7 +261,6 @@ ws://<host>/ws/notifications
 3. When a new notification is created for that student, the server pushes it immediately
 
 ### Real-Time Push Payload (Server → Client)
-
 ```json
 {
   "event": "new_notification",
@@ -280,7 +275,6 @@ ws://<host>/ws/notifications
 ```
 
 ### Client Acknowledgement (Client → Server)
-
 ```json
 {
   "event": "ack",
@@ -292,14 +286,159 @@ ws://<host>/ws/notifications
 
 ## Summary of Endpoints
 
-| Method | Endpoint                              | Description                    |
-|--------|---------------------------------------|--------------------------------|
-| GET    | /api/v1/notifications                 | Get all notifications (paged)  |
-| GET    | /api/v1/notifications/:id             | Get single notification        |
-| PATCH  | /api/v1/notifications/:id/read        | Mark one as read               |
-| PATCH  | /api/v1/notifications/read-all        | Mark all as read               |
-| DELETE | /api/v1/notifications/:id             | Delete a notification          |
-| POST   | /api/v1/notifications                 | Send notification (admin only) |
-| WS     | ws://host/ws/notifications            | Real-time push channel         |
+| Method | Endpoint                         | Description                    |
+|--------|----------------------------------|--------------------------------|
+| GET    | /api/v1/notifications            | Get all notifications (paged)  |
+| GET    | /api/v1/notifications/:id        | Get single notification        |
+| PATCH  | /api/v1/notifications/:id/read   | Mark one as read               |
+| PATCH  | /api/v1/notifications/read-all   | Mark all as read               |
+| DELETE | /api/v1/notifications/:id        | Delete a notification          |
+| POST   | /api/v1/notifications            | Send notification (admin only) |
+| WS     | ws://host/ws/notifications       | Real-time push channel         |
+
 
 ---
+
+# Stage 2
+
+## Persistent Storage — Database Choice
+
+### Recommended Database: PostgreSQL (Relational)
+
+**Why PostgreSQL?**
+- Notifications have a clear, structured schema — relational DB fits perfectly
+- Strong support for indexes, critical for querying by `studentID`, `isRead`, and `createdAt`
+- ACID compliance ensures no notification is lost or duplicated during high-volume sends
+- Native support for enums (e.g. `notification_type`)
+- Scales well with proper indexing and partitioning strategies
+- Widely supported, production-battle-tested, with excellent tooling
+
+---
+
+## Database Schema
+
+### Table: `students`
+```sql
+CREATE TABLE students (
+    id         UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
+    name       VARCHAR(100) NOT NULL,
+    email      VARCHAR(150) UNIQUE NOT NULL,
+    roll_no    VARCHAR(50)  UNIQUE NOT NULL,
+    created_at TIMESTAMP    NOT NULL DEFAULT NOW()
+);
+```
+
+### Enum: `notification_type`
+```sql
+CREATE TYPE notification_type AS ENUM ('Placement', 'Event', 'Result');
+```
+
+### Table: `notifications`
+```sql
+CREATE TABLE notifications (
+    id                UUID              PRIMARY KEY DEFAULT gen_random_uuid(),
+    student_id        UUID              NOT NULL REFERENCES students(id) ON DELETE CASCADE,
+    notification_type notification_type NOT NULL,
+    message           TEXT              NOT NULL,
+    is_read           BOOLEAN           NOT NULL DEFAULT FALSE,
+    created_at        TIMESTAMP         NOT NULL DEFAULT NOW(),
+    updated_at        TIMESTAMP         NOT NULL DEFAULT NOW()
+);
+```
+
+### Index Strategy
+```sql
+-- Composite index for the most frequent query: student + unread + sorted by time
+CREATE INDEX idx_notifications_student_unread
+    ON notifications(student_id, is_read, created_at DESC);
+
+-- Index for filtering by notification type
+CREATE INDEX idx_notifications_type
+    ON notifications(notification_type);
+```
+
+---
+
+## Problems as Data Volume Increases
+
+| Problem          | Description                                                            |
+|------------------|------------------------------------------------------------------------|
+| Slow queries     | Full table scans on 5M+ rows without indexes become very slow          |
+| High memory      | Fetching all notifications per student loads too much data into memory |
+| Write contention | Bulk inserts (50,000 students at once) can lock tables                 |
+| Storage bloat    | Old read notifications accumulate and slow down queries                |
+| Index overhead   | Too many indexes slow down INSERT/UPDATE operations                    |
+
+## Solutions
+
+| Problem          | Solution                                                               |
+|------------------|------------------------------------------------------------------------|
+| Slow queries     | Composite index on `(student_id, is_read, created_at)`                |
+| High memory      | Pagination with `LIMIT` / `OFFSET` or cursor-based                    |
+| Write contention | Async bulk inserts via a message queue (Redis / RabbitMQ)             |
+| Storage bloat    | Archive or delete notifications older than 90 days via cron job       |
+| Index overhead   | Only index columns used in WHERE, ORDER BY, or JOIN clauses           |
+
+---
+
+## SQL Queries Based on Stage 1 REST APIs
+
+### 1. Get all notifications for a student (paginated)
+```sql
+SELECT id, notification_type, message, is_read, created_at
+FROM notifications
+WHERE student_id = $1
+ORDER BY created_at DESC
+LIMIT $2 OFFSET $3;
+```
+
+### 2. Get a single notification by ID
+```sql
+SELECT id, notification_type, message, is_read, created_at
+FROM notifications
+WHERE id = $1 AND student_id = $2;
+```
+
+### 3. Mark a notification as read
+```sql
+UPDATE notifications
+SET is_read = TRUE, updated_at = NOW()
+WHERE id = $1 AND student_id = $2
+RETURNING id, is_read, updated_at;
+```
+
+### 4. Mark all notifications as read
+```sql
+UPDATE notifications
+SET is_read = TRUE, updated_at = NOW()
+WHERE student_id = $1 AND is_read = FALSE;
+```
+
+### 5. Delete a notification
+```sql
+DELETE FROM notifications
+WHERE id = $1 AND student_id = $2;
+```
+
+### 6. Send a notification to all students (admin)
+```sql
+INSERT INTO notifications (student_id, notification_type, message)
+SELECT id, $1, $2
+FROM students;
+```
+
+### 7. Get unread notification count
+```sql
+SELECT COUNT(*) AS unread_count
+FROM notifications
+WHERE student_id = $1 AND is_read = FALSE;
+```
+
+### 8. Filter notifications by type
+```sql
+SELECT id, notification_type, message, is_read, created_at
+FROM notifications
+WHERE student_id = $1 AND notification_type = $2
+ORDER BY created_at DESC
+LIMIT $3 OFFSET $4;
+```
