@@ -699,3 +699,97 @@ function process_job(job):
 | Partial failure recovery | Not possible       | Dead letter queue tracks failed jobs     |
 | Crash recovery           | Loses progress     | Queue persists; workers resume on restart|
 | 50,000 DB inserts        | One by one         | Single bulk INSERT                       |
+
+
+---
+
+# Stage 6
+
+## Priority Inbox — Approach
+
+### Problem
+Display the top N most important unread notifications first. Priority is determined by:
+- **Type weight**: Placement (3) > Result (2) > Event (1)
+- **Recency**: newer notifications score higher within the same type weight
+
+### Scoring Formula
+```
+score = typeWeight * 1000 + recencyScore
+
+recencyScore = seconds since oldest notification in batch (capped at 999)
+```
+
+Multiplying type weight by 1000 ensures type always dominates over recency, while recency breaks ties within the same type.
+
+### Algorithm — Min-Heap of Size N
+
+To efficiently maintain the top N notifications as new ones arrive:
+
+1. Maintain a **min-heap of size N** (smallest score at the top)
+2. For each new notification:
+   - If heap size < N → push it in
+   - If its score > heap minimum → pop the minimum, push the new one
+3. Result: heap always contains the top N highest-scored notifications
+
+**Time complexity**: O(M log N) where M = total notifications, N = top count  
+**Space complexity**: O(N)
+
+This is far more efficient than sorting all M notifications every time (O(M log M)).
+
+### How New Notifications Are Handled Efficiently
+- The min-heap structure means inserting a new notification is O(log N)
+- No need to re-sort the entire list — just compare against the current minimum
+- The heap self-maintains the top N at all times
+
+### API Endpoint
+
+**GET** `/api/v1/notifications/priority?n=10`
+
+**Headers:**
+```json
+{
+  "Authorization": "Bearer <token>"
+}
+```
+
+**Response (200 OK):**
+```json
+{
+  "success": true,
+  "topN": 10,
+  "count": 10,
+  "notifications": [
+    {
+      "ID": "b283218f-ea5a-4b7c-93a9-1f2f240d64b0",
+      "Type": "Placement",
+      "Message": "CSX Corporation hiring",
+      "Timestamp": "2026-04-22T17:51:18Z",
+      "score": 3999
+    }
+  ]
+}
+```
+
+### Folder Structure
+```
+notification_app_be/
+├── src/
+│   ├── config/
+│   │   └── config.ts           # App configuration
+│   ├── controller/
+│   │   └── notification.controller.ts  # Request handler
+│   ├── middleware/
+│   │   └── logger.middleware.ts        # Reusable Log function
+│   ├── route/
+│   │   └── notification.route.ts       # Express routes
+│   ├── service/
+│   │   └── notification.service.ts     # Business logic + scoring
+│   ├── types/
+│   │   └── notification.types.ts       # TypeScript interfaces
+│   ├── utils/
+│   │   └── priorityQueue.ts            # Min-heap implementation
+│   └── index.ts                        # Express app entry point
+├── package.json
+├── tsconfig.json
+└── .env
+```
