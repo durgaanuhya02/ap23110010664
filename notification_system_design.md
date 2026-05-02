@@ -442,3 +442,95 @@ WHERE student_id = $1 AND notification_type = $2
 ORDER BY created_at DESC
 LIMIT $3 OFFSET $4;
 ```
+
+
+---
+
+# Stage 3
+
+## Query Analysis
+
+### Original Query
+```sql
+SELECT * FROM notifications
+WHERE studentID = 1042 AND isRead = false
+ORDER BY createdAt DESC;
+```
+
+### Is this query accurate?
+Functionally yes — it correctly fetches unread notifications for a student sorted by newest first. However it has serious performance problems at scale.
+
+### Why is it slow?
+
+With 50,000 students and 5,000,000 notifications:
+
+1. **No index on `studentID` or `isRead`** — the database performs a full table scan across 5M rows on every request
+2. **`SELECT *`** — fetches all columns including unused ones, increasing I/O and memory usage
+3. **No `LIMIT`** — if a student has thousands of unread notifications, all are loaded into memory at once
+4. **`ORDER BY createdAt DESC` without an index** — sorting millions of rows in memory is expensive
+
+### Optimized Query
+```sql
+SELECT id, notification_type, message, is_read, created_at
+FROM notifications
+WHERE student_id = $1 AND is_read = FALSE
+ORDER BY created_at DESC
+LIMIT 20 OFFSET $2;
+```
+
+**Changes made:**
+- Replace `SELECT *` with only the required columns
+- Add `LIMIT` and `OFFSET` for pagination
+- Use parameterized query to prevent SQL injection
+- Backed by composite index: `(student_id, is_read, created_at DESC)`
+
+### Computation Cost: Before vs After
+
+| Metric        | Before (Original)           | After (Optimized)           |
+|---------------|-----------------------------|-----------------------------|
+| Rows scanned  | 5,000,000 (full table scan) | ~20 (index seek)            |
+| Sort cost     | High (in-memory sort)       | Low (index pre-sorted)      |
+| Memory usage  | High (all columns, no limit)| Low (selected cols, paged)  |
+| Query time    | Several seconds             | Milliseconds                |
+
+---
+
+## Should You Add Indexes on Every Column?
+
+**No. This is bad advice.**
+
+### Why over-indexing is harmful:
+- Every index consumes additional disk space
+- Every `INSERT`, `UPDATE`, and `DELETE` must update all indexes — slowing down writes significantly
+- At 5M rows with bulk inserts of 50,000 at a time, over-indexing causes serious write bottlenecks
+- The query optimizer can choose a suboptimal plan when too many indexes exist
+
+### Correct approach:
+Only index columns that appear in `WHERE`, `ORDER BY`, or `JOIN` clauses of your actual queries.
+
+```sql
+-- Covers the primary query pattern
+CREATE INDEX idx_notifications_student_unread
+    ON notifications(student_id, is_read, created_at DESC);
+
+-- For filtering by notification type
+CREATE INDEX idx_notifications_type
+    ON notifications(notification_type);
+```
+
+---
+
+## Query: Students Who Received a Placement Notification in the Last 7 Days
+
+```sql
+SELECT DISTINCT s.id, s.name, s.email, s.roll_no
+FROM students s
+JOIN notifications n ON n.student_id = s.id
+WHERE n.notification_type = 'Placement'
+  AND n.created_at >= NOW() - INTERVAL '7 days';
+```
+
+- Joins `students` and `notifications` on `student_id`
+- Filters by `notification_type = 'Placement'` using the enum
+- `NOW() - INTERVAL '7 days'` dynamically computes the 7-day window
+- `DISTINCT` ensures each student appears only once even with multiple placement notifications
