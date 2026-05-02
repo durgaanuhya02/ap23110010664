@@ -612,3 +612,90 @@ Set up a PostgreSQL read replica. All `SELECT` queries route to the replica; wri
 2. **Pagination** — default 20 notifications per page on all list endpoints
 3. **WebSockets** — push new notifications in real time; avoid polling entirely
 4. **Read replica** — add once traffic exceeds single DB capacity
+
+
+---
+
+# Stage 5
+
+## Shortcomings of the Original `notify_all` Implementation
+
+```
+function notify_all(student_ids: array, message: string):
+    for student_id in student_ids:
+        send_email(student_id, message)   # calls Email API
+        save_to_db(student_id, message)   # DB insert
+        push_to_app(student_id, message)  # WebSocket push
+```
+
+### Problems:
+
+1. **Synchronous loop over 50,000 students** — processes one student at a time; extremely slow and blocks the server
+2. **No error handling or retry logic** — if `send_email` fails for student 200, the entire loop stops or silently skips
+3. **Tightly coupled operations** — email, DB insert, and push happen together; one failure can affect the others
+4. **No partial failure recovery** — if the process crashes at student 25,000, there is no way to resume
+5. **DB write bottleneck** — 50,000 individual `INSERT` statements instead of a single bulk insert
+
+---
+
+## What Happens When `send_email` Fails for 200 Students Midway?
+
+With the original implementation, those 200 students simply don't get an email and there is no record of the failure. The loop either crashes or continues silently — the failure is undetected and unrecoverable.
+
+---
+
+## Should DB Save and Email Happen Together?
+
+**No.** They should be decoupled.
+
+- **DB insert** should happen immediately and independently — it is the source of truth
+- **Email sending** is a side effect that can be retried asynchronously if it fails
+- Coupling them means a failed email blocks or rolls back a successful DB write, which is wrong
+
+---
+
+## Redesigned Implementation
+
+### Architecture: Message Queue + Worker Pool
+
+Instead of a synchronous loop, publish notification jobs to a message queue (e.g. BullMQ / Redis Queue). Worker processes consume jobs concurrently and handle retries independently.
+
+### Revised Pseudocode
+
+```
+function notify_all(student_ids: array, message: string):
+    # Step 1: Bulk insert all notifications into DB immediately
+    bulk_save_to_db(student_ids, message)
+
+    # Step 2: Enqueue one job per student for email + push
+    for student_id in student_ids:
+        enqueue_job(queue="notifications", payload={
+            student_id: student_id,
+            message: message
+        })
+
+# Worker (runs concurrently, N workers in parallel)
+function process_job(job):
+    try:
+        send_email(job.student_id, job.message)
+        push_to_app(job.student_id, job.message)
+        mark_job_complete(job.id)
+    except EmailFailure:
+        if job.retry_count < 3:
+            requeue_job(job, delay=exponential_backoff(job.retry_count))
+        else:
+            log_to_dead_letter_queue(job)
+            Log("backend", "error", "service",
+                "Email delivery failed after 3 retries for student: " + job.student_id)
+```
+
+### Why This Is Better
+
+| Issue                    | Original           | Redesigned                               |
+|--------------------------|--------------------|------------------------------------------|
+| Speed                    | Sequential (slow)  | Parallel workers (fast)                  |
+| Email failure handling   | None               | Retry with exponential backoff           |
+| DB + email coupling      | Tightly coupled    | Decoupled — DB writes always succeed     |
+| Partial failure recovery | Not possible       | Dead letter queue tracks failed jobs     |
+| Crash recovery           | Loses progress     | Queue persists; workers resume on restart|
+| 50,000 DB inserts        | One by one         | Single bulk INSERT                       |
