@@ -534,3 +534,81 @@ WHERE n.notification_type = 'Placement'
 - Filters by `notification_type = 'Placement'` using the enum
 - `NOW() - INTERVAL '7 days'` dynamically computes the 7-day window
 - `DISTINCT` ensures each student appears only once even with multiple placement notifications
+
+
+---
+
+# Stage 4
+
+## Problem: DB Overwhelmed on Every Page Load
+
+Fetching notifications from the database on every page load for 50,000 students is unsustainable. Below are strategies to solve this with their tradeoffs.
+
+---
+
+## Strategy 1: Server-Side Caching with Redis
+
+**How it works:**
+Cache the result of each student's notification query in Redis with a short TTL. On subsequent requests within the TTL, serve from cache — no DB hit. Invalidate the cache when a new notification arrives or when a notification is marked as read.
+
+```
+Cache key : notifications:<studentID>:unread
+TTL       : 60 seconds
+Invalidate: on new notification insert or mark-as-read
+```
+
+| Tradeoff | Detail |
+|----------|--------|
+| Pro | Dramatically reduces DB load; sub-millisecond response times |
+| Pro | Scales horizontally across multiple app servers |
+| Con | May serve slightly stale data within the TTL window |
+| Con | Adds infrastructure complexity; cache invalidation must be carefully managed |
+
+---
+
+## Strategy 2: Pagination
+
+**How it works:**
+Instead of loading all notifications at once, load 20 at a time using `LIMIT`/`OFFSET` or cursor-based pagination.
+
+| Tradeoff | Detail |
+|----------|--------|
+| Pro | Reduces memory and DB load per request significantly |
+| Pro | Works well even without a caching layer |
+| Con | Frontend must implement "load more" or infinite scroll |
+
+---
+
+## Strategy 3: Real-Time Push via WebSocket (Eliminate Polling)
+
+**How it works:**
+Use the WebSocket channel designed in Stage 1. The client fetches notifications once on login and then receives new ones via push — no repeated DB reads on page load.
+
+| Tradeoff | Detail |
+|----------|--------|
+| Pro | Eliminates repeated DB reads entirely |
+| Pro | Best user experience — instant delivery |
+| Con | Requires persistent WebSocket connections on the server |
+| Con | Must handle reconnection and missed messages gracefully |
+
+---
+
+## Strategy 4: Database Read Replicas
+
+**How it works:**
+Set up a PostgreSQL read replica. All `SELECT` queries route to the replica; writes go to the primary. Distributes read load across multiple DB instances.
+
+| Tradeoff | Detail |
+|----------|--------|
+| Pro | Scales reads horizontally without changing application logic much |
+| Con | Replication lag — replica may be slightly behind the primary |
+| Con | Higher infrastructure and maintenance cost |
+
+---
+
+## Recommended Combined Approach
+
+1. **Redis cache** — cache unread notifications per student (TTL: 60s), invalidate on write
+2. **Pagination** — default 20 notifications per page on all list endpoints
+3. **WebSockets** — push new notifications in real time; avoid polling entirely
+4. **Read replica** — add once traffic exceeds single DB capacity
